@@ -1,48 +1,68 @@
-"""Transcription (FR -> EN) using Canary."""
+"""Transcription (FR -> EN) via remote API."""
 
 from __future__ import annotations
 
+import os
 from typing import Iterable, List
 
-from .models import load_canary
+import requests
+
+from .config import (
+    API_BASE_URL,
+    API_KEY,
+    API_TRANSCRIPTION_MODEL,
+    API_TRANSCRIPTION_TIMEOUT,
+)
+from .logging_utils import setup_logging
+
+LOGGER = setup_logging()
 
 
-def _normalize_canary_output(item) -> str:
-    if isinstance(item, dict):
-        for key in ("pred_text", "text", "translation_text", "answer"):
-            value = item.get(key)
-            if isinstance(value, str):
-                return value
-        return ""
-    value = str(item)
-    if "text=" in value:
+def _build_headers() -> dict:
+    headers = {}
+    if API_KEY:
+        headers["Authorization"] = f"Bearer {API_KEY}"
+    return headers
+
+
+def _transcribe_file(path: str) -> str:
+    url = f"{API_BASE_URL.rstrip('/')}/audio/transcriptions"
+    data = {
+        "model": API_TRANSCRIPTION_MODEL,
+        "language": "fr",
+        "translate": True,
+        "response_format": "json",
+    }
+    with open(path, "rb") as handle:
+        files = {"file": (os.path.basename(path), handle, "application/octet-stream")}
         try:
-            return value.split("text=", 1)[1].split("'", 1)[1].rsplit("'", 1)[0]
-        except Exception:
-            return value
-    return value
+            LOGGER.debug("Requesting transcription for %s", path)
+            response = requests.post(
+                url,
+                headers=_build_headers(),
+                data=data,
+                files=files,
+                timeout=API_TRANSCRIPTION_TIMEOUT,
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:  # pragma: no cover - network failure path
+            raise RuntimeError(f"Remote transcription failed for {path}") from exc
+    try:
+        payload = response.json()
+    except ValueError:
+        return response.text.strip()
+    if isinstance(payload, dict):
+        if isinstance(payload.get("text"), str):
+            return payload["text"].strip()
+        data_entries = payload.get("data")
+        if isinstance(data_entries, list) and data_entries:
+            entry = data_entries[0]
+            if isinstance(entry, dict) and isinstance(entry.get("text"), str):
+                return entry["text"].strip()
+    return str(payload).strip()
 
 
 def canary_transcribe(paths: Iterable[str], batch_size: int = 6) -> List[str]:
-    model = load_canary()
-    kwargs = dict(
-        audio=list(paths),
-        batch_size=batch_size,
-        taskname="ast",
-        source_lang="fr",
-        target_lang="en",
-        pnc="yes",
-        num_workers=0,
-        pretokenize=False,
-        pin_memory=False,
-    )
-    try:
-        outputs = model.transcribe(**kwargs)
-    except TypeError:
-        outputs = model.transcribe(audio=list(paths), batch_size=batch_size)
-    if isinstance(outputs, list):
-        return [_normalize_canary_output(item).strip() for item in outputs]
-    if isinstance(outputs, str):
-        return [outputs.strip()]
-    return [str(outputs).strip()]
+    del batch_size  # batching is handled server-side
+    return [_transcribe_file(path) for path in paths]
 

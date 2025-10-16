@@ -6,7 +6,7 @@ import json
 import re
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from .models import build_chat_prompt, lfm_generate
+from .models import chat_generate_batch
 
 _ARRAY_RE = re.compile(r"\[[\s\S]*\]")
 _WORD_RE = re.compile(r"[\w'\-]+", re.UNICODE)
@@ -81,13 +81,11 @@ def request_aliases(turns: List[Tuple[str, str]]) -> Dict[str, str]:
         f"Conversation:\n{conversation}\n\n"
         "Provide aliases now."
     )
-    chat_prompt = build_chat_prompt(
-        [
-            {"role": "system", "content": instructions},
-            {"role": "user", "content": prompt},
-        ]
-    )
-    response = lfm_generate([chat_prompt])[0]
+    messages = [
+        {"role": "system", "content": instructions},
+        {"role": "user", "content": prompt},
+    ]
+    response = chat_generate_batch([messages])[0]
     match = _ARRAY_RE.search(response)
     if not match:
         return {}

@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import re
-from typing import Iterable, List
+from typing import List
 
-from .config import LFM_BATCH
-from .models import build_chat_prompt, lfm_generate
+from .config import LLM_BATCH
+from .models import chat_generate
 
 _SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z])")
 _EN_WORD_RE = re.compile(r"[A-Za-z]{3,}")
@@ -39,21 +39,19 @@ def translate(text: str) -> str:
     if not sentences:
         return ""
     prompts = [
-        build_chat_prompt(
-            [
-                {
-                    "role": "system",
-                    "content": "You are a precise translation engine. Translate English into German without adding comments or extra explanations.",
-                },
-                {"role": "user", "content": sentence},
-            ]
-        )
+        [
+            {
+                "role": "system",
+                "content": "You are a precise translation engine. Translate English into German without adding comments or extra explanations.",
+            },
+            {"role": "user", "content": sentence},
+        ]
         for sentence in sentences
     ]
     outputs = []
-    for index in range(0, len(prompts), LFM_BATCH):
-        batch = prompts[index:index + LFM_BATCH]
-        outputs.extend(lfm_generate(batch))
+    for index in range(0, len(prompts), LLM_BATCH):
+        batch = prompts[index:index + LLM_BATCH]
+        outputs.extend(chat_generate(batch))
     cleaned: List[str] = []
     for candidate in outputs:
         candidate = re.sub(r"(?i)^(assistant|system|user)\s*:\s*", "", candidate).strip()

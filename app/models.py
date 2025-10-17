@@ -1,148 +1,103 @@
-"""Model management (download and load)."""
+"""Helpers to interact with external inference APIs."""
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, MutableMapping, Optional, Sequence
 
-import torch
-from huggingface_hub import hf_hub_download, login, snapshot_download
-from nemo.collections.asr.models import EncDecMultiTaskModel
-from transformers import AutoModelForCausalLM, AutoTokenizer
+import requests
 
-from .config import BF16_AVAILABLE, CANARY_FILENAME, CANARY_REPO, DEVICE, LFM_REPO, MAX_NEW_TOKENS, MODELS_DIR
+from .config import API_BASE_URL, API_KEY, CANARY_API_MODEL, LLM_MODEL, MAX_NEW_TOKENS
 from .logging_utils import setup_logging
 
 LOGGER = setup_logging()
-
-_CANARY_MODEL: Optional[EncDecMultiTaskModel] = None
-_LFM_MODEL: Optional[AutoModelForCausalLM] = None
-_LFM_TOKENIZER = None
-_BAD_WORDS_IDS: Optional[List[List[int]]] = None
+_SESSION = requests.Session()
 
 
-def _ensure_hf_login() -> None:
-    token = os.environ.get("HUGGINGFACE_TOKEN", "").strip()
-    if not token:
-        raise RuntimeError("HUGGINGFACE_TOKEN environment variable must be provided.")
-    login(token=token, add_to_git_credential=False)
+def _build_headers(extra: Optional[MutableMapping[str, str]] = None) -> MutableMapping[str, str]:
+    headers: MutableMapping[str, str] = {"Accept": "application/json"}
+    if API_KEY:
+        headers["Authorization"] = f"Bearer {API_KEY}"
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+def _post(
+    path: str,
+    *,
+    json: Optional[dict] = None,
+    data: Optional[dict] = None,
+    files: Optional[dict] = None,
+    headers: Optional[MutableMapping[str, str]] = None,
+    timeout: int = 600,
+):
+    url = f"{API_BASE_URL}/{path.lstrip('/')}"
+    merged_headers = _build_headers(headers)
+    response = _SESSION.post(url, json=json, data=data, files=files, headers=merged_headers, timeout=timeout)
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:  # pragma: no cover - informative logging
+        LOGGER.error("API request to %s failed: %s", url, exc)
+        LOGGER.debug("Response content: %s", response.text)
+        raise
+    if "application/json" in response.headers.get("Content-Type", ""):
+        return response.json()
+    return response.text
 
 
 def ensure_models() -> Dict[str, str]:
-    """Download required models lazily."""
-    _ensure_hf_login()
-    status: Dict[str, str] = {}
-
-    lfm_dir = MODELS_DIR / "lfm"
-    lfm_dir.mkdir(parents=True, exist_ok=True)
-    if not any(lfm_dir.glob("*.safetensors")):
-        LOGGER.info("Downloading LFM model…")
-        snapshot_download(LFM_REPO, local_dir=lfm_dir, local_dir_use_symlinks=False)
-    status["lfm"] = "ok"
-
-    canary_dir = MODELS_DIR / "canary"
-    canary_dir.mkdir(parents=True, exist_ok=True)
-    canary_file = canary_dir / CANARY_FILENAME
-    if not canary_file.exists():
-        LOGGER.info("Downloading Canary model…")
-        hf_hub_download(CANARY_REPO, filename=CANARY_FILENAME, local_dir=canary_dir, local_dir_use_symlinks=False)
-    status["canary"] = "ok"
-
-    return status
+    """Return a static status map indicating API-backed models."""
+    return {"canary": CANARY_API_MODEL, "llm": LLM_MODEL}
 
 
-def load_canary() -> EncDecMultiTaskModel:
-    global _CANARY_MODEL
-    if _CANARY_MODEL is not None:
-        return _CANARY_MODEL
-    ensure_models()
-    canary_dir = MODELS_DIR / "canary"
-    nemo_path = canary_dir / CANARY_FILENAME
-    LOGGER.info("Loading Canary model (%s)…", nemo_path)
-    model = EncDecMultiTaskModel.restore_from(str(nemo_path), map_location=DEVICE)
-    try:
-        decoding_cfg = model.cfg.decoding
-        decoding_cfg.beam.beam_size = 1
-        model.change_decoding_strategy(decoding_cfg)
-    except Exception:
-        pass
-    for ds_name in ("train_ds", "validation_ds", "test_ds"):
-        dataset_cfg = getattr(model.cfg, ds_name, None)
-        if dataset_cfg is None:
-            continue
-        for attr in ("num_workers", "pin_memory"):
-            if hasattr(dataset_cfg, attr):
-                setattr(dataset_cfg, attr, 0 if attr == "num_workers" else False)
-    _CANARY_MODEL = model.to(DEVICE).eval()
-    return _CANARY_MODEL
-
-
-def load_lfm():
-    global _LFM_MODEL, _LFM_TOKENIZER, _BAD_WORDS_IDS
-    if _LFM_MODEL is not None and _LFM_TOKENIZER is not None:
-        return _LFM_TOKENIZER, _LFM_MODEL, _BAD_WORDS_IDS
-    ensure_models()
-    lfm_dir = MODELS_DIR / "lfm"
-    LOGGER.info("Loading LFM model from %s", lfm_dir)
-    tokenizer = AutoTokenizer.from_pretrained(lfm_dir, local_files_only=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"
-    dtype = torch.bfloat16 if BF16_AVAILABLE else torch.float16 if torch.cuda.is_available() else torch.float32
-    model = AutoModelForCausalLM.from_pretrained(lfm_dir, local_files_only=True, torch_dtype=dtype).to(DEVICE)
-    model.eval()
-    bad_phrases = [
-        "German:",
-        "Deutsch:",
-        "English:",
-        "Translate",
-        "Translation",
-        "Output only",
-        "labels",
-        "explanations",
-        "Note:",
-        "Hinweis",
-        "Anmerkung",
-        "system",
-        "user",
-        "assistant",
-    ]
-    _BAD_WORDS_IDS = [tokenizer(phrase, add_special_tokens=False).input_ids for phrase in bad_phrases]
-    _LFM_MODEL = model
-    _LFM_TOKENIZER = tokenizer
-    return tokenizer, model, _BAD_WORDS_IDS
-
-
-def lfm_generate(prompts: List[str], max_new_tokens: int = MAX_NEW_TOKENS) -> List[str]:
-    tokenizer, model, bad_words_ids = load_lfm()
-    encodings = tokenizer(prompts, padding=True, return_tensors="pt").to(model.device)
-    with torch.inference_mode():
-        generations = model.generate(
-            **encodings,
-            max_new_tokens=max_new_tokens,
-            eos_token_id=tokenizer.eos_token_id,
-            bad_words_ids=bad_words_ids,
-            do_sample=False,
-            top_p=1.0,
-            repetition_penalty=1.02,
-            no_repeat_ngram_size=3,
-        )
+def canary_transcribe_api(paths: Iterable[str], *, language: str = "fr", translate: bool = True) -> List[str]:
+    """Transcribe audio files via the Canary API endpoint."""
     outputs: List[str] = []
-    attn = encodings["attention_mask"]
-    for batch_index in range(generations.size(0)):
-        prompt_length = int(attn[batch_index].sum().item())
-        new_tokens = generations[batch_index, prompt_length:]
-        text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+    for path in paths:
+        with open(path, "rb") as audio_file:
+            file_name = Path(path).name
+            files = {"file": (file_name, audio_file, "application/octet-stream")}
+            data = {
+                "model": CANARY_API_MODEL,
+                "response_format": "json",
+                "temperature": "0",
+                "translate": "true" if translate else "false",
+            }
+            if language:
+                data["language"] = language
+            response = _post("audio/transcriptions", data=data, files=files)
+        if isinstance(response, dict):
+            text = (
+                response.get("text")
+                or response.get("translation_text")
+                or response.get("transcription")
+                or response.get("result")
+                or ""
+            )
+        else:
+            text = str(response)
         outputs.append(text.strip())
     return outputs
 
 
-def build_chat_prompt(messages: List[Dict[str, str]]) -> str:
-    tokenizer, _, _ = load_lfm()
-    if hasattr(tokenizer, "apply_chat_template"):
-        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    system_messages = "\n".join(message["content"] for message in messages if message["role"] == "system")
-    user_messages = "\n".join(message["content"] for message in messages if message["role"] == "user")
-    return f"<<SYS>> {system_messages} <</SYS>>\n{user_messages}\n"
+def chat_generate(messages_list: Sequence[Sequence[Dict[str, str]]], *, max_new_tokens: int = MAX_NEW_TOKENS) -> List[str]:
+    """Generate chat completions using the remote LLM."""
+    results: List[str] = []
+    for messages in messages_list:
+        payload = {
+            "model": LLM_MODEL,
+            "messages": list(messages),
+            "max_tokens": max_new_tokens,
+            "temperature": 0.0,
+        }
+        response = _post("chat/completions", json=payload, timeout=300)
+        if isinstance(response, dict) and response.get("choices"):
+            content = response["choices"][0]["message"].get("content", "")
+        else:
+            content = str(response)
+        results.append((content or "").strip())
+    return results
 
+
+__all__ = ["canary_transcribe_api", "chat_generate", "ensure_models"]

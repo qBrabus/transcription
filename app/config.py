@@ -42,13 +42,14 @@ TARGET_SR = 16_000
 DIARIZATION_PRIMARY = "pyannote/speaker-diarization-3.1"
 DIARIZATION_SECONDARY = "pyannote/speaker-diarization-community-1"
 
-CANARY_REPO = "nvidia/canary-1b-v2"
-CANARY_FILENAME = "canary-1b-v2.nemo"
-
-LFM_REPO = "LiquidAI/LFM2-2.6B"
+API_BASE_URL = os.environ.get("TRANSCRIPTION_API_BASE_URL", "http://10.200.50.46:8000/v1").rstrip("/")
+API_KEY = os.environ.get("TRANSCRIPTION_API_KEY", "").strip()
+CANARY_API_MODEL = os.environ.get("TRANSCRIPTION_CANARY_MODEL", "canary-1b-v2")
+LLM_MODEL = os.environ.get("TRANSCRIPTION_LLM_MODEL", "Qwen3-VL-30B-A3B-Instruct")
 
 TRANSLATION_BATCH = 16
-LFM_BATCH = 8
+LLM_BATCH = int(os.environ.get("TRANSCRIPTION_LLM_BATCH", "8"))
+LFM_BATCH = LLM_BATCH  # Backwards compatibility for legacy imports
 CANARY_BATCH = 6
 
 MAX_CANARY_WINDOW = 35.0

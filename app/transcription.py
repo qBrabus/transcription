@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Iterable, List
 
-from .models import load_canary
+from .models import canary_transcribe_api
 
 
 def _normalize_canary_output(item) -> str:
@@ -24,25 +24,7 @@ def _normalize_canary_output(item) -> str:
 
 
 def canary_transcribe(paths: Iterable[str], batch_size: int = 6) -> List[str]:
-    model = load_canary()
-    kwargs = dict(
-        audio=list(paths),
-        batch_size=batch_size,
-        taskname="ast",
-        source_lang="fr",
-        target_lang="en",
-        pnc="yes",
-        num_workers=0,
-        pretokenize=False,
-        pin_memory=False,
-    )
-    try:
-        outputs = model.transcribe(**kwargs)
-    except TypeError:
-        outputs = model.transcribe(audio=list(paths), batch_size=batch_size)
-    if isinstance(outputs, list):
-        return [_normalize_canary_output(item).strip() for item in outputs]
-    if isinstance(outputs, str):
-        return [outputs.strip()]
-    return [str(outputs).strip()]
+    del batch_size  # The API handles batching internally.
+    outputs = canary_transcribe_api(list(paths), language="fr", translate=True)
+    return [_normalize_canary_output(item).strip() for item in outputs]
 
